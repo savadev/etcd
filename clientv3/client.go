@@ -425,3 +425,16 @@ func toErr(ctx context.Context, err error) error {
 	}
 	return err
 }
+
+func canceledByCaller(ctx context.Context, err error) bool {
+	if ctx.Err() == nil {
+		return false
+	}
+	if err == nil {
+		return false
+	}
+	if err != context.Canceled && err != context.DeadlineExceeded {
+		return false
+	}
+	return true
+}

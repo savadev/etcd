@@ -67,6 +67,9 @@ const (
 	leaseResponseChSize = 16
 	// NoLease is a lease ID for the absence of a lease.
 	NoLease LeaseID = 0
+
+	// retryConnWait is how long to wait before retrying request due to an error
+	retryConnWait = 500 * time.Millisecond
 )
 
 // ErrKeepAliveHalted is returned if client keep alive loop halts with an unexpected error.
@@ -354,19 +357,33 @@ func (l *lessor) recvKeepAliveLoop() (gerr error) {
 		l.mu.Unlock()
 	}()
 
-	stream, serr := l.resetRecv()
-	for serr == nil {
-		resp, err := stream.Recv()
+	for {
+		stream, err := l.resetRecv()
 		if err != nil {
-			if isHaltErr(l.stopCtx, err) {
+			if canceledByCaller(l.stopCtx, err) {
 				return err
 			}
-			stream, serr = l.resetRecv()
-			continue
+		} else {
+			for {
+				resp, err := stream.Recv()
+				if err != nil {
+					if canceledByCaller(l.stopCtx, err) {
+						return err
+					}
+					break
+				}
+
+				l.recvKeepAlive(resp)
+			}
 		}
-		l.recvKeepAlive(resp)
+
+		select {
+		case <-time.After(retryConnWait):
+			continue
+		case <-l.stopCtx.Done():
+			return l.stopCtx.Err()
+		}
 	}
-	return serr
 }
 
 // resetRecv opens a new lease stream and starts sending LeaseKeepAliveRequests
