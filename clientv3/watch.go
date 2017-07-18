@@ -15,7 +15,6 @@
 package clientv3
 
 import (
-	"fmt"
 	"sync"
 	"time"
 
@@ -108,8 +107,8 @@ type watcher struct {
 	// mu protects the grpc streams map
 	mu sync.RWMutex
 
-	// streams holds all the active grpc streams keyed by ctx value.
-	streams map[string]*watchGrpcStream
+	// streams holds all the active grpc streams keyed by ctx.
+	streams map[context.Context]*watchGrpcStream
 }
 
 // watchGrpcStream tracks all watch resources attached to a single grpc stream.
@@ -119,9 +118,9 @@ type watchGrpcStream struct {
 
 	// ctx controls internal remote.Watch requests
 	ctx context.Context
-	// ctxKey is the key used when looking up this stream's context
-	ctxKey string
-	cancel context.CancelFunc
+	// lookupCtx is the ctx used when looking up this stream's context
+	lookupCtx context.Context
+	cancel    context.CancelFunc
 
 	// substreams holds all active watchers on this grpc stream
 	substreams map[int64]*watcherStream
@@ -192,7 +191,7 @@ func NewWatcher(c *Client) Watcher {
 func NewWatchFromWatchClient(wc pb.WatchClient) Watcher {
 	return &watcher{
 		remote:  wc,
-		streams: make(map[string]*watchGrpcStream),
+		streams: make(map[context.Context]*watchGrpcStream),
 	}
 }
 
@@ -213,7 +212,7 @@ func (w *watcher) newWatcherGrpcStream(inctx context.Context) *watchGrpcStream {
 		owner:      w,
 		remote:     w.remote,
 		ctx:        ctx,
-		ctxKey:     fmt.Sprintf("%v", inctx),
+		lookupCtx:  inctx,
 		cancel:     cancel,
 		substreams: make(map[int64]*watcherStream),
 
@@ -253,7 +252,6 @@ func (w *watcher) Watch(ctx context.Context, key string, opts ...OpOption) Watch
 	}
 
 	ok := false
-	ctxKey := fmt.Sprintf("%v", ctx)
 
 	// find or allocate appropriate grpc watch stream
 	w.mu.Lock()
@@ -264,10 +262,10 @@ func (w *watcher) Watch(ctx context.Context, key string, opts ...OpOption) Watch
 		close(ch)
 		return ch
 	}
-	wgs := w.streams[ctxKey]
+	wgs := w.streams[ctx]
 	if wgs == nil {
 		wgs = w.newWatcherGrpcStream(ctx)
-		w.streams[ctxKey] = wgs
+		w.streams[ctx] = wgs
 	}
 	donec := wgs.donec
 	reqc := wgs.reqc
@@ -338,7 +336,7 @@ func (w *watcher) closeStream(wgs *watchGrpcStream) {
 	close(wgs.donec)
 	wgs.cancel()
 	if w.streams != nil {
-		delete(w.streams, wgs.ctxKey)
+		delete(w.streams, wgs.lookupCtx)
 	}
 	w.mu.Unlock()
 }
