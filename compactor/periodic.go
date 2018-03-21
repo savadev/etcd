@@ -30,11 +30,11 @@ import (
 type Periodic struct {
 	clock  clockwork.Clock
 	period time.Duration
+	revs   []int64
 
 	rg RevGetter
 	c  Compactable
 
-	revs   []int64
 	ctx    context.Context
 	cancel context.CancelFunc
 
@@ -49,27 +49,24 @@ func NewPeriodic(h time.Duration, rg RevGetter, c Compactable) *Periodic {
 	return &Periodic{
 		clock:  clockwork.NewRealClock(),
 		period: h,
+		revs:   make([]int64, 0),
 		rg:     rg,
 		c:      c,
 	}
 }
 
-// periodDivisor divides Periodic.period in into checkCompactInterval duration
-const periodDivisor = 10
-
 func (t *Periodic) Run() {
 	t.ctx, t.cancel = context.WithCancel(context.Background())
-	t.revs = make([]int64, 0)
-	clock := t.clock
-	checkCompactInterval := t.period / time.Duration(periodDivisor)
+	interval := t.getInterval()
+
+	last := t.clock.Now()
 	go func() {
-		last := clock.Now()
 		for {
 			t.revs = append(t.revs, t.rg.Rev())
 			select {
 			case <-t.ctx.Done():
 				return
-			case <-clock.After(checkCompactInterval):
+			case <-t.clock.After(interval):
 				t.mu.Lock()
 				p := t.paused
 				t.mu.Unlock()
@@ -77,24 +74,37 @@ func (t *Periodic) Run() {
 					continue
 				}
 			}
-			if clock.Now().Sub(last) < t.period {
+
+			// wait up to initial given period
+			if t.clock.Now().Sub(last) < t.period {
 				continue
 			}
-			rev, remaining := t.getRev()
-			if rev < 0 {
-				continue
-			}
+			rev := t.revs[0]
+
 			plog.Noticef("Starting auto-compaction at revision %d (retention: %v)", rev, t.period)
 			_, err := t.c.Compact(t.ctx, &pb.CompactionRequest{Revision: rev})
 			if err == nil || err == mvcc.ErrCompacted {
-				t.revs = remaining
 				plog.Noticef("Finished auto-compaction at revision %d", rev)
+				// move to next sliding window
+				t.revs = t.revs[1:]
 			} else {
 				plog.Noticef("Failed auto-compaction at revision %d (%v)", rev, err)
-				plog.Noticef("Retry after %v", checkCompactInterval)
+				plog.Noticef("Retry after %v", interval)
 			}
 		}
 	}()
+}
+
+// if given compaction period x is <1-hour, compact every x duration.
+// (e.g. --auto-compaction-mode 'periodic' --auto-compaction-retention='10m', then compact every 10-minute)
+// if given compaction period x is >1-hour, compact every hour.
+// (e.g. --auto-compaction-mode 'periodic' --auto-compaction-retention='2h', then compact every 1-hour)
+func (t *Periodic) getInterval() time.Duration {
+	itv := t.period
+	if itv > time.Hour {
+		itv = time.Hour
+	}
+	return itv
 }
 
 func (t *Periodic) Stop() {
@@ -111,12 +121,4 @@ func (t *Periodic) Resume() {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	t.paused = false
-}
-
-func (t *Periodic) getRev() (int64, []int64) {
-	i := len(t.revs) - periodDivisor
-	if i < 0 {
-		return -1, t.revs
-	}
-	return t.revs[i], t.revs[i+1:]
 }

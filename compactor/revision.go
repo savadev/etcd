@@ -17,6 +17,7 @@ package compactor
 import (
 	"context"
 	"sync"
+	"time"
 
 	pb "github.com/coreos/etcd/etcdserver/etcdserverpb"
 	"github.com/coreos/etcd/mvcc"
@@ -51,17 +52,18 @@ func NewRevision(retention int64, rg RevGetter, c Compactable) *Revision {
 	}
 }
 
+const revInterval = 5 * time.Minute
+
 func (t *Revision) Run() {
 	t.ctx, t.cancel = context.WithCancel(context.Background())
 	clock := t.clock
-	previous := int64(0)
-
+	prev := int64(0)
 	go func() {
 		for {
 			select {
 			case <-t.ctx.Done():
 				return
-			case <-clock.After(checkCompactionInterval):
+			case <-clock.After(revInterval):
 				t.mu.Lock()
 				p := t.paused
 				t.mu.Unlock()
@@ -71,19 +73,18 @@ func (t *Revision) Run() {
 			}
 
 			rev := t.rg.Rev() - t.retention
-
-			if rev <= 0 || rev == previous {
+			if rev <= 0 || rev == prev {
 				continue
 			}
 
 			plog.Noticef("Starting auto-compaction at revision %d (retention: %d revisions)", rev, t.retention)
 			_, err := t.c.Compact(t.ctx, &pb.CompactionRequest{Revision: rev})
 			if err == nil || err == mvcc.ErrCompacted {
-				previous = rev
+				prev = rev
 				plog.Noticef("Finished auto-compaction at revision %d", rev)
 			} else {
 				plog.Noticef("Failed auto-compaction at revision %d (%v)", rev, err)
-				plog.Noticef("Retry after %v", checkCompactionInterval)
+				plog.Noticef("Retry after %v", revInterval)
 			}
 		}
 	}()

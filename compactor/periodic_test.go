@@ -21,96 +21,122 @@ import (
 
 	pb "github.com/coreos/etcd/etcdserver/etcdserverpb"
 	"github.com/coreos/etcd/pkg/testutil"
+
 	"github.com/jonboulle/clockwork"
 )
 
-func TestPeriodic(t *testing.T) {
-	retentionHours := 2
-	retentionDuration := time.Duration(retentionHours) * time.Hour
-
+func TestPeriodicHourly(t *testing.T) {
 	fc := clockwork.NewFakeClock()
 	rg := &fakeRevGetter{testutil.NewRecorderStream(), 0}
 	compactable := &fakeCompactable{testutil.NewRecorderStream()}
 	tb := &Periodic{
 		clock:  fc,
-		period: retentionDuration,
+		period: 24 * time.Hour,
 		rg:     rg,
 		c:      compactable,
 	}
 
 	tb.Run()
 	defer tb.Stop()
-	checkCompactInterval := retentionDuration / time.Duration(periodDivisor)
-	n := periodDivisor
-	// simulate 5 hours worth of intervals.
-	for i := 0; i < n/retentionHours*5; i++ {
-		rg.Wait(1)
-		fc.Advance(checkCompactInterval)
-		// compaction doesn't happen til 2 hours elapses.
-		if i < n {
-			continue
-		}
-		// after 2 hours, compaction happens at every checkCompactInterval.
-		a, err := compactable.Wait(1)
-		if err != nil {
+
+	for i := 0; i < 24*2; i++ {
+		// first 24-hour only with rev gets
+		if _, err := rg.Wait(1); err != nil {
 			t.Fatal(err)
 		}
-		expectedRevision := int64(i + 1 - n)
-		if !reflect.DeepEqual(a[0].Params[0], &pb.CompactionRequest{Revision: expectedRevision}) {
-			t.Errorf("compact request = %v, want %v", a[0].Params[0], &pb.CompactionRequest{Revision: expectedRevision})
-		}
-	}
+		fc.Advance(time.Hour)
 
-	// unblock the rev getter, so we can stop the compactor routine.
-	_, err := rg.Wait(1)
-	if err != nil {
-		t.Fatal(err)
+		// after 24-hour compact kicks in, every hour
+		// with 24-hour retention window
+		if i >= 23 {
+			ca, err := compactable.Wait(1)
+			if err != nil {
+				t.Fatal(err)
+			}
+			expectedRevision := int64(i + 2 - 24)
+			if !reflect.DeepEqual(ca[0].Params[0], &pb.CompactionRequest{Revision: expectedRevision}) {
+				t.Errorf("compact request = %v, want %v", ca[0].Params[0], &pb.CompactionRequest{Revision: expectedRevision})
+			}
+		}
 	}
 }
 
-func TestPeriodicPause(t *testing.T) {
+func TestPeriodicEveryMinute(t *testing.T) {
 	fc := clockwork.NewFakeClock()
-	compactable := &fakeCompactable{testutil.NewRecorderStream()}
 	rg := &fakeRevGetter{testutil.NewRecorderStream(), 0}
-	retentionDuration := time.Hour
+	compactable := &fakeCompactable{testutil.NewRecorderStream()}
 	tb := &Periodic{
 		clock:  fc,
-		period: retentionDuration,
+		period: time.Minute,
 		rg:     rg,
 		c:      compactable,
 	}
 
 	tb.Run()
+	defer tb.Stop()
+
+	// expect compact every minute
+	for i := 0; i < 10; i++ {
+		if _, err := rg.Wait(1); err != nil {
+			t.Fatal(err)
+		}
+		fc.Advance(time.Minute)
+
+		ca, err := compactable.Wait(1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		expectedRevision := int64(i + 1)
+		if !reflect.DeepEqual(ca[0].Params[0], &pb.CompactionRequest{Revision: expectedRevision}) {
+			t.Errorf("compact request = %v, want %v", ca[0].Params[0], &pb.CompactionRequest{Revision: expectedRevision})
+		}
+	}
+}
+
+func TestPeriodicPauseHourly(t *testing.T) {
+	fc := clockwork.NewFakeClock()
+	rg := &fakeRevGetter{testutil.NewRecorderStream(), 0}
+	compactable := &fakeCompactable{testutil.NewRecorderStream()}
+	tb := &Periodic{
+		clock:  fc,
+		period: 10 * time.Hour,
+		rg:     rg,
+		c:      compactable,
+	}
+
+	tb.Run()
+	defer tb.Stop()
+
 	tb.Pause()
 
-	// tb will collect 3 hours of revisions but not compact since paused
-	checkCompactInterval := retentionDuration / time.Duration(periodDivisor)
-	n := periodDivisor
-	for i := 0; i < 3*n; i++ {
-		rg.Wait(1)
-		fc.Advance(checkCompactInterval)
+	// collect 20 hours of revisions with no compaction
+	for i := 0; i < 20; i++ {
+		if _, err := rg.Wait(1); err != nil {
+			t.Fatal(err)
+		}
+		fc.Advance(time.Hour)
 	}
-	// tb ends up waiting for the clock
-
 	select {
 	case a := <-compactable.Chan():
 		t.Fatalf("unexpected action %v", a)
 	case <-time.After(10 * time.Millisecond):
 	}
 
-	// tb resumes to being blocked on the clock
 	tb.Resume()
 
-	// unblock clock, will kick off a compaction at hour 3:06
-	rg.Wait(1)
-	fc.Advance(checkCompactInterval)
-	a, err := compactable.Wait(1)
-	if err != nil {
-		t.Fatal(err)
-	}
-	// compact the revision from hour 2:06
-	wreq := &pb.CompactionRequest{Revision: int64(1 + 2*n + 1)}
-	if !reflect.DeepEqual(a[0].Params[0], wreq) {
-		t.Errorf("compact request = %v, want %v", a[0].Params[0], wreq.Revision)
+	for i := 0; i < 20; i++ {
+		if _, err := rg.Wait(1); err != nil {
+			t.Fatal(err)
+		}
+		fc.Advance(time.Hour)
+
+		ca, err := compactable.Wait(1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		expectedRevision := int64(i + 1)
+		if !reflect.DeepEqual(ca[0].Params[0], &pb.CompactionRequest{Revision: expectedRevision}) {
+			t.Errorf("compact request = %v, want %v", ca[0].Params[0], &pb.CompactionRequest{Revision: expectedRevision})
+		}
 	}
 }

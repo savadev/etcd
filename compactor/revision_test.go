@@ -38,13 +38,13 @@ func TestRevision(t *testing.T) {
 	tb.Run()
 	defer tb.Stop()
 
-	fc.Advance(checkCompactionInterval)
+	fc.Advance(revInterval)
 	rg.Wait(1)
 	// nothing happens
 
 	rg.SetRev(99) // will be 100
 	expectedRevision := int64(90)
-	fc.Advance(checkCompactionInterval)
+	fc.Advance(revInterval)
 	rg.Wait(1)
 	a, err := compactable.Wait(1)
 	if err != nil {
@@ -61,7 +61,7 @@ func TestRevision(t *testing.T) {
 
 	rg.SetRev(199) // will be 200
 	expectedRevision = int64(190)
-	fc.Advance(checkCompactionInterval)
+	fc.Advance(revInterval)
 	rg.Wait(1)
 	a, err = compactable.Wait(1)
 	if err != nil {
@@ -87,9 +87,9 @@ func TestRevisionPause(t *testing.T) {
 	tb.Pause()
 
 	// tb will collect 3 hours of revisions but not compact since paused
-	n := int(time.Hour / checkCompactionInterval)
+	n := int(time.Hour / revInterval)
 	for i := 0; i < 3*n; i++ {
-		fc.Advance(checkCompactionInterval)
+		fc.Advance(revInterval)
 	}
 	// tb ends up waiting for the clock
 
@@ -103,7 +103,7 @@ func TestRevisionPause(t *testing.T) {
 	tb.Resume()
 
 	// unblock clock, will kick off a compaction at hour 3:05
-	fc.Advance(checkCompactionInterval)
+	fc.Advance(revInterval)
 	rg.Wait(1)
 	a, err := compactable.Wait(1)
 	if err != nil {
