@@ -57,39 +57,74 @@ func NewPeriodic(h time.Duration, rg RevGetter, c Compactable) *Periodic {
 
 func (t *Periodic) Run() {
 	t.ctx, t.cancel = context.WithCancel(context.Background())
-	interval := t.getInterval()
+	fetchInterval := t.getFetchInterval()
+	retryInterval := t.getRetryInterval()
+	retentions := int(t.period / fetchInterval) // number of revs to keep for t.period
+	notify := make(chan struct{}, 1)
 
-	last := t.clock.Now()
+	// periodically updates t.revs and notify to the other goroutine
 	go func() {
 		for {
-			t.revs = append(t.revs, t.rg.Rev())
+			rev := t.rg.Rev()
+			t.mu.Lock()
+			t.revs = append(t.revs, rev)
+			if len(t.revs) > retentions {
+				t.revs = t.revs[1:] // t.revs[0] is always the rev at t.period ago
+			}
+			t.mu.Unlock()
+
+			select {
+			case notify <- struct{}{}:
+			default:
+				// compaction can take time more than interval
+			}
+
 			select {
 			case <-t.ctx.Done():
 				return
-			case <-t.clock.After(interval):
-				t.mu.Lock()
-				p := t.paused
-				t.mu.Unlock()
-				if p {
-					continue
-				}
+			case <-t.clock.After(fetchInterval):
+			}
+		}
+	}()
+
+	// run compaction triggered by the other goroutine thorough the notify channel
+	// or internal periodic retry
+	go func() {
+		var lastCompactedRev int64
+		for {
+			select {
+			case <-t.ctx.Done():
+				return
+			case <-notify:
+				// from the other goroutine
+			case <-t.clock.After(retryInterval):
+				// for retry
+				// when t.rev is not updated, this event will be ignored later,
+				// so we don't need to think about race with <-notify.
 			}
 
-			// wait up to initial given period
-			if t.clock.Now().Sub(last) < t.period {
+			t.mu.Lock()
+			p := t.paused
+			rev := t.revs[0]
+			t.mu.Unlock()
+			if p {
 				continue
 			}
-			rev := t.revs[0]
+
+			// if t.revs is not updated, we can ignore the event.
+			// it's not the first time to try comapction in this interval.
+			if rev == lastCompactedRev {
+				continue
+			}
 
 			plog.Noticef("Starting auto-compaction at revision %d (retention: %v)", rev, t.period)
 			_, err := t.c.Compact(t.ctx, &pb.CompactionRequest{Revision: rev})
 			if err == nil || err == mvcc.ErrCompacted {
 				plog.Noticef("Finished auto-compaction at revision %d", rev)
-				// move to next sliding window
-				t.revs = t.revs[1:]
+				lastCompactedRev = rev
 			} else {
 				plog.Noticef("Failed auto-compaction at revision %d (%v)", rev, err)
-				plog.Noticef("Retry after %v", interval)
+				plog.Noticef("Retry after %s", retryInterval)
 			}
 		}
 	}()
@@ -99,10 +134,29 @@ func (t *Periodic) Run() {
 // (e.g. --auto-compaction-mode 'periodic' --auto-compaction-retention='10m', then compact every 10-minute)
 // if given compaction period x is >1-hour, compact every hour.
 // (e.g. --auto-compaction-mode 'periodic' --auto-compaction-retention='2h', then compact every 1-hour)
-func (t *Periodic) getInterval() time.Duration {
+func (t *Periodic) getFetchInterval() time.Duration {
 	itv := t.period
 	if itv > time.Hour {
 		itv = time.Hour
+	}
+	return itv
+}
+
+const retryDivisor = 10
+
+func (t *Periodic) getRetryInterval() time.Duration {
+	itv := t.period / retryDivisor
+	// we don't want to too aggressive retries
+	// and also jump between 6-minute through 60-minute
+	if itv < (6 * time.Minute) { // t.period is less than hour
+		// if t.period is less than 6-minute,
+		// retry interval is t.period.
+		// if we divide byretryDivisor, it's too aggressive
+		if t.period < 6*time.Minute {
+			itv = t.period
+		} else {
+			itv = 6 * time.Minute
+		}
 	}
 	return itv
 }

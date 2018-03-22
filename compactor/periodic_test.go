@@ -109,6 +109,8 @@ func TestPeriodicPauseHourly(t *testing.T) {
 
 	tb.Pause()
 
+	// t.revs = [1] (len=1)
+
 	// collect 20 hours of revisions with no compaction
 	for i := 0; i < 20; i++ {
 		if _, err := rg.Wait(1); err != nil {
@@ -122,6 +124,12 @@ func TestPeriodicPauseHourly(t *testing.T) {
 	case <-time.After(10 * time.Millisecond):
 	}
 
+	// If we don't have window slide
+	// t.revs = [1, 2, 3, ..., 21] (len=21)
+	// but in reality, the size is capped to 10 (retentions)
+	// t.revs = [12, 13, 14, 15, 16, 17, 18, 19, 20, 21] (len=10)
+	revInPaused := 12
+
 	tb.Resume()
 
 	for i := 0; i < 20; i++ {
@@ -134,7 +142,7 @@ func TestPeriodicPauseHourly(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		expectedRevision := int64(i + 1)
+		expectedRevision := int64(i + revInPaused)
 		if !reflect.DeepEqual(ca[0].Params[0], &pb.CompactionRequest{Revision: expectedRevision}) {
 			t.Errorf("compact request = %v, want %v", ca[0].Params[0], &pb.CompactionRequest{Revision: expectedRevision})
 		}
